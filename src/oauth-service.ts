@@ -1,4 +1,5 @@
-import {Base64} from 'js-base64';
+// Modified from: https://github.com/manfredsteyer/angular-oauth2-oidc commit 513863a9f9c02dbd778d17031180e8bf67a8caee
+import { Base64 } from 'js-base64';
 import {fromByteArray} from 'base64-js';
 import * as _sha256 from 'sha256';
 import { Http, URLSearchParams, Headers } from '@angular/http';
@@ -25,6 +26,18 @@ export class OAuthService {
     public clearHashAfterLogin: boolean = true;
     public tokenEndpoint: string;
     public userinfoEndpoint: string;
+
+    // AAD B2C
+    aadb2c: boolean = false;
+    logoutRedirectUri = "";
+    aadb2cPolicy: string = "";
+    getHeaders(): any {
+        let headers = new Headers();
+        headers.append('Content-Type', 'application/json');
+        headers.append('Authorization', this.authorizationHeader())
+        return headers;
+    }
+
 
     public dummyClientSecret: string;
     
@@ -194,12 +207,23 @@ export class OAuthService {
 
             var response_type = "token";
 
-            if (that.oidc) {
+            // AAD B2C
+            var b2cPolicy = "";
+            if (that.aadb2c) {
+                response_type = "id_token";
+                b2cPolicy = that.aadb2cPolicy
+                if (b2cPolicy) {
+                    b2cPolicy = "p=" + b2cPolicy;
+                }
+            }
+            else if (that.oidc) {
                 response_type = "id_token+token";
             }
 
             var url = that.loginUrl 
-                        + "?response_type="
+                        + "?"
+                        + b2cPolicy
+                        + "&response_type="
                         + response_type
                         + "&client_id=" 
                         + encodeURIComponent(that.clientId)
@@ -208,7 +232,7 @@ export class OAuthService {
                         + "&redirect_uri=" 
                         + encodeURIComponent(that.redirectUri) 
                         + "&scope=" 
-                        + encodeURIComponent(that.scope);
+                + encodeURIComponent(that.scope);
 
             if (that.resource) {
                 url += "&resource=" + encodeURIComponent(that.resource);
@@ -217,7 +241,7 @@ export class OAuthService {
             if (that.oidc) {
                 url += "&nonce=" + encodeURIComponent(nonce);
             }
-            
+
             return url;
         });
     };
@@ -262,27 +286,36 @@ export class OAuthService {
 
     tryLogin(options) {
         
-        options = options || { };
-        
-        
+        options = options || {};
+
         var parts = this.getFragment();
 
         var accessToken = parts["access_token"];
         var idToken = parts["id_token"];
         var state = parts["state"];
-        
+
+        if (this.aadb2c) {
+            accessToken = parts["code"];
+        }
+
         var oidcSuccess = false;
         var oauthSuccess = false;
 
-        if (!accessToken || !state) return false;
-        if (this.oidc && !idToken) return false;
+        if (this.oidc) {
+            if (!idToken) {
+                return false;
+            }
+        }
+        else if (!accessToken || !state) {
+            return false;
+        }
 
         var savedNonce = this._storage.getItem("nonce");
 
         var stateParts = state.split(';');
         var nonceInState = stateParts[0];
         if (savedNonce === nonceInState) {
-            
+
             this.storeAccessTokenResponse(accessToken, null, parts['expires_in']);
 
             if (stateParts.length > 1) {
@@ -290,14 +323,13 @@ export class OAuthService {
             }
 
             oauthSuccess = true;
-
         }
         
         if (!oauthSuccess) return false;
 
         if (this.oidc) {
             oidcSuccess = this.processIdToken(idToken, accessToken);
-            if (!oidcSuccess) return false;  
+            if (!oidcSuccess) return false;
         }
         
         if (options.validationHandler) {
@@ -338,28 +370,24 @@ export class OAuthService {
             var claims = JSON.parse(claimsJson);
             var savedNonce = this._storage.getItem("nonce");
             
-            if (Array.isArray(claims.aud)) {
-                if (claims.aud.every(v => v !== this.clientId)) {
-                    console.warn("Wrong audience: " + claims.aud.join(","));
-                    return false;
-                }
-            } else {
-                if (claims.aud !== this.clientId) {
-                    console.warn("Wrong audience: " + claims.aud);
-                    return false;
-                }
+            if (claims.aud !== this.clientId) {
+                console.warn("Wrong audience: " + claims.aud);
+                return false;
             }
 
-            if (this.issuer && claims.iss !== this.issuer) {
-                console.warn("Wrong issuer: " + claims.iss);
-                return false;
+            // short circut issuer for AAD B2C
+            if (!this.aadb2c) {
+                if (this.issuer && claims.iss !== this.issuer) {
+                    console.warn("Wrong issuer: " + claims.iss);
+                    return false;
+                }
             }
 
             if (claims.nonce !== savedNonce) {
                 console.warn("Wrong nonce: " + claims.nonce);
                 return false;
             }
-            
+
             if (accessToken && !this.checkAtHash(accessToken, claims)) {
                 console.warn("Wrong at_hash");
                 return false;
@@ -454,7 +482,8 @@ export class OAuthService {
     };
     
     authorizationHeader() {
-        return "Bearer " + this.getAccessToken();
+        //return "Bearer " + this.getAccessToken();
+        return "Bearer " + this.getIdToken();
     }
     
     logOut(noRedirectToLogoutUrl: boolean = false) {
@@ -471,16 +500,21 @@ export class OAuthService {
         if (noRedirectToLogoutUrl) return;
         
         let logoutUrl: string;
-        
+
+        if (this.aadb2c) {
+            var policy = this.aadb2cPolicy || '';
+            logoutUrl = this.logoutUrl + '?p=' + policy + '&post_logout_redirect_uri=' + encodeURIComponent(this.logoutRedirectUri);
+        }
+
         // For backward compatibility
-        if (this.logoutUrl.indexOf('{{') > -1) {
+        else if (this.logoutUrl.indexOf('{{') > -1) {
             logoutUrl = this.logoutUrl.replace(/\{\{id_token\}\}/, id_token);
         }
         else {
-            logoutUrl = this.logoutUrl + "?id_token_hint=" 
+            logoutUrl = this.logoutUrl + "?id_token=" 
                                 + encodeURIComponent(id_token)
-                                + "&post_logout_redirect_uri="
-                                + encodeURIComponent(this.redirectUri);
+                                + "&redirect_uri="
+                                + encodeURIComponent(this.logoutRedirectUri);
         }
         location.href = logoutUrl;
     };
@@ -558,22 +592,24 @@ export class OAuthService {
     
 
     checkAtHash(accessToken, idClaims) {
-        if (!accessToken || !idClaims || !idClaims.at_hash ) return true;
-        var tokenHash: Array<any> = sha256(accessToken, { asBytes: true });
-        var leftMostHalf = tokenHash.slice(0, (tokenHash.length/2) );
-        var tokenHashBase64 = fromByteArray(leftMostHalf);
-        var atHash = tokenHashBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-        var claimsAtHash = idClaims.at_hash.replace(/=/g, "");
+        return true;
+        // DANE
+        //if (!accessToken || !idClaims || !idClaims.at_hash ) return true;
+        //var tokenHash: Array<any> = sha256(accessToken, { asBytes: true });
+        //var leftMostHalf = tokenHash.slice(0, (tokenHash.length / 2));
+        //var tokenHashBase64 = fromByteArray(leftMostHalf);
+        //var atHash = tokenHashBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+        //var claimsAtHash = idClaims.at_hash.replace(/=/g, "");
         
-        var atHash = tokenHashBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+        //var atHash = tokenHashBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 
-        if (atHash != claimsAtHash) {
-            console.warn("exptected at_hash: " + atHash);    
-            console.warn("actual at_hash: " + claimsAtHash);
-        }
+        //if (atHash != claimsAtHash) {
+        //    console.warn("exptected at_hash: " + atHash);    
+        //    console.warn("actual at_hash: " + claimsAtHash);
+        //}
         
         
-        return (atHash == claimsAtHash);
+        //return (atHash == claimsAtHash);
     }
     
 }
